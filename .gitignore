@@ -10,6 +10,7 @@
 
 # No USD files allowed in the repo
 **/*.usd
+!meeting/2026-04-26/ant_instanceable.usd
 **/*.usda
 **/*.usdc
 **/*.usdz

@@ -334,6 +334,37 @@ Ant 有 8 个可控关节：
 a_t \in \mathbb{R}^8
 \]
 
+从 `ANT_CFG.init_state.joint_pos` 可以直接看到关节命名：
+
+`source/isaaclab_assets/isaaclab_assets/robots/ant.py:37`
+
+默认关节位置：
+
+```python
+joint_pos={
+    ".*_leg": 0.0,
+    "front_left_foot": 0.785398,
+    "front_right_foot": -0.785398,
+    "left_back_foot": -0.785398,
+    "right_back_foot": 0.785398,
+}
+```
+
+对应 8 个 DOF 大概是：
+
+| 关节名 | 默认角度 rad | 默认角度 deg | 说明 |
+|---|---:|---:|---|
+| `front_left_leg` | 0.0 | 0° | 前左腿 hip/leg |
+| `front_left_foot` | 0.785398 | 45° | 前左脚/膝 |
+| `front_right_leg` | 0.0 | 0° | 前右腿 hip/leg |
+| `front_right_foot` | -0.785398 | -45° | 前右脚/膝 |
+| `left_back_leg` | 0.0 | 0° | 左后腿 hip/leg |
+| `left_back_foot` | -0.785398 | -45° | 左后脚/膝 |
+| `right_back_leg` | 0.0 | 0° | 右后腿 hip/leg |
+| `right_back_foot` | 0.785398 | 45° | 右后脚/膝 |
+
+注意：`".*_leg": 0.0` 是正则，匹配所有以 `_leg` 结尾的 joint。
+
 代码：
 
 ```python
@@ -463,7 +494,29 @@ x_0^{(i)} = x_{default} + o^{(i)}
 
 ---
 
-## 7.3 potential 初始化
+## 7.3 reset 具体清掉哪些状态
+
+`reset_idx(env_ids)` 不只是把机器人位置放回去，还会把当前 episode 的训练状态一起清零：
+
+```python
+self.episode_length_buf[env_ids] = 0
+self.actions[env_ids] = 0.0
+self.reset_terminated[env_ids] = False
+self.reset_time_outs[env_ids] = False
+```
+
+逐行解释：
+
+| 代码 | 中文含义 | 为什么需要 |
+|---|---|---|
+| `episode_length_buf = 0` | 这个 env 的 episode 步数从 0 重新开始计数 | 否则刚 reset 完可能立刻被判定 timeout |
+| `actions = 0.0` | 上一次动作清零 | observation 里包含 previous action，reset 后不能沿用旧 episode 的动作 |
+| `reset_terminated = False` | 清掉“摔倒终止”标记 | 新 episode 还没有摔倒 |
+| `reset_time_outs = False` | 清掉“时间到截断”标记 | 新 episode 还没有超时 |
+
+---
+
+## 7.4 potential 初始化
 
 Ant 的 progress reward 用 potential 差值：
 
@@ -471,12 +524,29 @@ Ant 的 progress reward 用 potential 差值：
 \Phi_t = -\frac{\lVert p_{target} - p_t \rVert}{\Delta t_{phys}}
 \]
 
+代码里的实际数值是：
+
+```python
+sim_dt = 1 / 120 = 0.008333... s
+target = env_origin + [1000, 0, 0]
+```
+
 reset 时需要初始化：
 
 ```python
-self.potentials[env_ids] = -norm(to_target) / sim_dt
+to_target = self.targets[env_ids] - root_state[:, :3]
+to_target[:, 2] = 0.0
+self.potentials[env_ids] = -torch.norm(to_target, dim=-1) / self.cfg.sim_dt
 self.prev_potentials[env_ids] = self.potentials[env_ids]
 ```
+
+中文解释：
+
+- `to_target`：从 Ant 当前 root 位置指向目标点的向量。
+- `to_target[:, 2] = 0.0`：只关心水平面上的前进距离，不把高度差算进 progress。
+- `potentials`：当前时刻的 potential。
+- `prev_potentials`：上一时刻的 potential。
+- reset 时二者设成一样，是为了让新 episode 第一帧的 progress reward 从 0 附近开始。
 
 否则新 episode 会继承旧 episode 的 progress 信息，reward 会错。
 
@@ -486,26 +556,85 @@ self.prev_potentials[env_ids] = self.potentials[env_ids]
 
 ## 8.1 step 总流程
 
+`step(actions)` 表示执行一个 RL 控制步。输入是 policy 输出的动作：
+
+```python
+actions: [num_envs, 8]
+```
+
+如果默认 `num_envs = 4096`，那么 shape 是：
+
+```text
+actions: [4096, 8]
+```
+
+总流程：
+
 ```text
 actions [N, 8]
     |
     v
-缓存 self.actions
+self.actions = actions.clone()
     |
     v
 for decimation=2:
-    joint_efforts = 7.5 * actions
+    joint_efforts = 0.5 * 15.0 * actions = 7.5 * actions
     robot.set_joint_effort_target(joint_efforts)
     scene.write_data_to_sim()
-    sim.step()
-    scene.update()
+    sim.step(render=False)
+    scene.update(sim_dt)
     |
     v
+episode_length_buf += 1
 compute_dones()
 compute_rewards()
 reset done envs
 compute_observations()
+return obs, rewards, dones, extras
 ```
+
+对应代码：
+
+```python
+self.actions = actions.to(self.device).clone()
+
+for _ in range(self.cfg.decimation):
+    joint_efforts = self.cfg.action_scale * self.joint_gears * self.actions
+    self.robot.set_joint_effort_target(joint_efforts, joint_ids=self.joint_ids)
+
+    self.scene.write_data_to_sim()
+    self.sim.step(render=False)
+    self.scene.update(self.cfg.sim_dt)
+
+self.episode_length_buf += 1
+self.reset_terminated, self.reset_time_outs = self.compute_dones()
+dones = self.reset_terminated | self.reset_time_outs
+rewards = self.compute_rewards(self.reset_terminated)
+
+reset_env_ids = dones.nonzero(as_tuple=False).squeeze(-1)
+self.reset_idx(reset_env_ids)
+
+obs = self.compute_observations(update_potential=False)
+extras = {"time_outs": self.reset_time_outs.clone()}
+return obs, rewards, dones, extras
+```
+
+逐行解释：
+
+| 代码 | 中文含义 | 具体数值 / 形状 |
+|---|---|---|
+| `self.actions = actions.clone()` | 保存当前动作，后面 reward 和 observation 都会用到 | `[4096, 8]` 或 `[N, 8]` |
+| `for _ in range(decimation)` | 一个 RL step 内重复跑多个 physics step | `decimation = 2` |
+| `joint_efforts = action_scale * joint_gears * actions` | 把 policy 动作转成关节 effort | `0.5 * 15.0 * actions = 7.5 * actions` |
+| `set_joint_effort_target` | 把 8 个关节 effort 写到 Ant articulation | 每个 Ant 8 个关节 |
+| `write_data_to_sim()` | 把 IsaacLab buffer 中的控制命令提交给 PhysX | 写入仿真器 |
+| `sim.step(render=False)` | 推进一个物理步 | `sim_dt = 1/120 s` |
+| `scene.update(sim_dt)` | 从仿真器读回 root/joint/contact 等最新状态 | 更新 tensor buffer |
+| `episode_length_buf += 1` | 每个 env 的 episode 长度加 1 个 RL step | 1 step = `1/60 s` |
+| `compute_dones()` | 判断是否摔倒或时间到 | 返回 `terminated`, `time_outs` |
+| `compute_rewards()` | 根据最新状态算 reward | `[N]` |
+| `reset_idx(done envs)` | 自动重置已经 done 的 env | 只 reset done 的那部分 |
+| `compute_observations()` | 构造下一帧 36 维观测 | `[N, 36]` |
 
 ---
 
@@ -600,11 +729,44 @@ r_t = r_{death} = -2
 
 ## 9.1 progress reward
 
-目标点是每个环境 origin 前方 \(+x\) 方向很远的位置：
+目标点是每个环境 origin 前方 \(+x\) 方向很远的位置。
+
+代码：
+
+```python
+self.targets = torch.tensor([1000.0, 0.0, 0.0], device=self.device).repeat(num_envs, 1)
+self.targets += self.scene.env_origins
+```
+
+数学上：
 
 \[
 p_{target}^{(i)} = o^{(i)} + [1000, 0, 0]^\top
 \]
+
+也就是第 \(i\) 个 Ant 的目标点，不是世界固定 `[1000, 0, 0]`，而是这个 env 自己 origin 前方 1000m。
+
+代码计算 potential：
+
+```python
+to_target = self.targets - root_pos
+to_target[:, 2] = 0.0
+
+self.prev_potentials[:] = self.potentials
+self.potentials[:] = -torch.norm(to_target, dim=-1) / self.cfg.sim_dt
+
+progress_reward = self.potentials - self.prev_potentials
+```
+
+逐行解释：
+
+| 代码 | 中文含义 | 具体数值 |
+|---|---|---:|
+| `to_target = targets - root_pos` | 从当前 Ant 位置指向目标点的向量 | `[N, 3]` |
+| `to_target[:, 2] = 0.0` | 忽略高度，只看水平面距离 | z 方向清零 |
+| `norm(to_target)` | 到目标点的水平距离 | 单位 m |
+| `/ self.cfg.sim_dt` | 除以物理步长，把距离差变成近似速度量 | `sim_dt = 1/120` |
+| `potentials - prev_potentials` | 当前 potential 减上一帧 potential | progress reward |
 
 定义 potential：
 
@@ -650,24 +812,47 @@ h_t = \hat f_t \cdot \hat d_t
 
 其中：
 
-- \(\hat f_t\)：机器人身体局部 x 轴在世界坐标下的方向
-- \(\hat d_t\)：从机器人指向目标的单位向量
+- \(\hat f_t\)：机器人身体局部 x 轴在世界坐标下的方向。
+- \(\hat d_t\)：从机器人指向目标的单位向量。
+- 点积越接近 1，说明身体朝向越接近目标方向；越接近 -1，说明背对目标。
+
+代码：
+
+```python
+heading_reward = torch.where(
+    heading_proj > 0.8,
+    torch.full_like(heading_proj, self.cfg.heading_weight),
+    self.cfg.heading_weight * heading_proj / 0.8,
+)
+```
+
+具体参数：
+
+```python
+heading_weight = 0.5
+heading_threshold = 0.8
+```
 
 reward：
 
 \[
 r_{heading} =
 \begin{cases}
-w_h, & h_t > 0.8 \\
-\frac{w_h}{0.8}h_t, & h_t \le 0.8
+0.5, & h_t > 0.8 \\
+\frac{0.5}{0.8}h_t, & h_t \le 0.8
 \end{cases}
 \]
 
-代码参数：
+举例：
 
-```python
-heading_weight = 0.5
-```
+| `heading_proj` | 中文含义 | `heading_reward` |
+|---:|---|---:|
+| 1.0 | 完全朝向目标 | 0.5 |
+| 0.9 | 基本朝向目标，超过阈值 | 0.5 |
+| 0.8 | 刚到阈值附近 | 0.5 |
+| 0.4 | 只对准一半 | 0.25 |
+| 0.0 | 和目标方向垂直 | 0.0 |
+| -0.8 | 基本背向目标 | -0.5 |
 
 即：朝目标方向越准，奖励越高。
 
@@ -681,21 +866,48 @@ up projection：
 u_t = \hat z_{body,t} \cdot \hat z_{world}
 \]
 
+它衡量 Ant 身体局部 z 轴和世界 z 轴的对齐程度：
+
+- \(u_t \approx 1\)：身体基本竖直。
+- \(u_t \approx 0\)：身体横过来了。
+- \(u_t < 0\)：身体可能翻过去了。
+
+代码：
+
+```python
+up_reward = torch.where(
+    up_proj > 0.93,
+    torch.full_like(up_proj, self.cfg.up_weight),
+    torch.zeros_like(up_proj),
+)
+```
+
+具体参数：
+
+```python
+up_weight = 0.1
+up_threshold = 0.93
+```
+
 reward：
 
 \[
 r_{up} =
 \begin{cases}
-w_u, & u_t > 0.93 \\
+0.1, & u_t > 0.93 \\
 0, & \text{otherwise}
 \end{cases}
 \]
 
-代码参数：
+这不是线性奖励，而是一个 hard bonus：
 
-```python
-up_weight = 0.1
-```
+| `up_proj` | 中文含义 | `up_reward` |
+|---:|---|---:|
+| 1.0 | 很直立 | 0.1 |
+| 0.95 | 足够直立 | 0.1 |
+| 0.93 | 阈值附近 | 0.0 或接近边界 |
+| 0.5 | 明显歪了 | 0.0 |
+| -0.5 | 翻倒趋势 | 0.0 |
 
 即：身体足够直立才给 bonus。
 
@@ -703,11 +915,31 @@ up_weight = 0.1
 
 ## 9.4 alive reward
 
-只要没摔倒，每步给固定奖励：
+只要没摔倒，每步给固定奖励。
+
+代码：
+
+```python
+alive_reward = torch.full_like(self.potentials, self.cfg.alive_reward_scale)
+```
+
+具体参数：
+
+```python
+alive_reward_scale = 0.5
+```
+
+所以：
 
 \[
 r_{alive} = 0.5
 \]
+
+中文解释：
+
+- 每个 env 每个 RL step 都先给 `0.5` 的存活奖励。
+- 如果没有摔倒，这个奖励会保留在总 reward 里。
+- 如果摔倒，最后会被 `death_cost = -2.0` 覆盖掉。
 
 作用：鼓励 Ant 延长 episode，不要快速摔倒。
 
@@ -715,22 +947,48 @@ r_{alive} = 0.5
 
 ## 9.5 action cost
 
-动作幅度惩罚：
+动作幅度惩罚。
+
+代码：
+
+```python
+actions_cost = torch.sum(self.actions.square(), dim=-1)
+```
+
+先对 8 个 action 分量平方求和：
 
 \[
-c_{action} = \alpha_a \sum_i a_i^2
+\sum_{i=1}^{8} a_i^2
 \]
 
-其中：
+然后在总 reward 里乘系数扣掉：
+
+```python
+- self.cfg.actions_cost_scale * actions_cost
+```
+
+具体参数：
 
 ```python
 actions_cost_scale = 0.005
 ```
 
-即：
+所以惩罚项是：
 
 \[
-\alpha_a = 0.005
+c_{action} = 0.005 \sum_{i=1}^{8} a_i^2
+\]
+
+举例：如果某个 env 的 8 维 action 都是 1：
+
+\[
+\sum_i a_i^2 = 8
+\]
+
+那么 action cost 扣分是：
+
+\[
+0.005 \times 8 = 0.04
 \]
 
 作用：避免 policy 输出过大的关节命令。
@@ -739,19 +997,48 @@ actions_cost_scale = 0.005
 
 ## 9.6 electricity / energy cost
 
-能耗惩罚：
+能耗惩罚。
+
+代码：
+
+```python
+electricity_cost = torch.sum(
+    torch.abs(self.actions * joint_vel * self.cfg.dof_vel_scale)
+    * self.motor_effort_ratio.unsqueeze(0),
+    dim=-1,
+)
+```
+
+逐项解释：
+
+| 代码 | 中文含义 | 数值 |
+|---|---|---:|
+| `self.actions` | policy 输出的 8 维动作 | `[N, 8]` |
+| `joint_vel` | 8 个关节当前速度 | `[N, 8]` |
+| `dof_vel_scale` | 关节速度缩放 | `0.2` |
+| `motor_effort_ratio` | 每个电机的能耗权重 | 全部是 `1.0` |
+| `abs(...)` | 只关心幅度，不关心正负方向 | - |
+| `sum(..., dim=-1)` | 对 8 个关节求和 | 得到 `[N]` |
+
+数学上：
 
 \[
-c_{energy} = \alpha_e \sum_i |a_i \dot q_i s_v| m_i
+c_{energy} = 0.05 \sum_{i=1}^{8} |a_i \dot q_i \cdot 0.2| \cdot 1
 \]
 
 其中：
 
-- \(a_i\)：第 \(i\) 个动作
-- \(\dot q_i\)：第 \(i\) 个关节速度
-- \(s_v = 0.2\)：`dof_vel_scale`
-- \(m_i\)：`motor_effort_ratio`，这里全为 1
-- \(\alpha_e = 0.05\)：`energy_cost_scale`
+- \(a_i\)：第 \(i\) 个动作。
+- \(\dot q_i\)：第 \(i\) 个关节速度。
+- \(0.2\)：`dof_vel_scale`。
+- \(1\)：`motor_effort_ratio`，这里所有关节都一样。
+- \(0.05\)：`energy_cost_scale`。
+
+注意代码里 `electricity_cost` 先只算求和部分，真正乘 `0.05` 是在总 reward 里：
+
+```python
+- self.cfg.energy_cost_scale * electricity_cost
+```
 
 直觉：动作大且关节速度大，认为耗能更高。
 
@@ -759,15 +1046,60 @@ c_{energy} = \alpha_e \sum_i |a_i \dot q_i s_v| m_i
 
 ## 9.7 joint limit cost
 
-关节接近极限时惩罚：
+关节接近极限时惩罚。
+
+代码：
+
+```python
+dof_at_limit_cost = torch.sum(dof_pos_scaled > 0.98, dim=-1).float()
+```
+
+其中 `dof_pos_scaled` 是归一化后的关节位置：
+
+```python
+dof_pos_scaled = scale_to_minus_one_one(joint_pos, lower, upper)
+```
+
+归一化公式：
 
 \[
-c_{limit} = \sum_i \mathbf{1}(\tilde q_i > 0.98)
+\tilde q_i = \frac{2q_i - q_i^{upper} - q_i^{lower}}{q_i^{upper} - q_i^{lower}}
 \]
 
-其中 \(\tilde q_i\) 是归一化后的关节位置。
+直觉：
 
-作用：避免关节长期顶在 limit 上。
+- \(\tilde q_i \approx -1\)：接近下限。
+- \(\tilde q_i \approx 0\)：在 joint limit 中间。
+- \(\tilde q_i \approx 1\)：接近上限。
+
+代码只惩罚：
+
+```python
+dof_pos_scaled > 0.98
+```
+
+也就是关节非常接近上限时，每个这样的关节扣 `1.0`：
+
+\[
+c_{limit} = \sum_{i=1}^{8} \mathbf{1}(\tilde q_i > 0.98)
+\]
+
+举例：
+
+| 接近上限的关节数 | `dof_at_limit_cost` | reward 扣分 |
+|---:|---:|---:|
+| 0 | 0 | 0 |
+| 1 | 1 | -1 |
+| 3 | 3 | -3 |
+| 8 | 8 | -8 |
+
+注意这个项在总 reward 里没有额外小系数：
+
+```python
+- dof_at_limit_cost
+```
+
+所以它比 action cost 更“硬”，作用是强烈避免关节长期顶在 limit 上。
 
 ---
 
@@ -779,13 +1111,48 @@ c_{limit} = \sum_i \mathbf{1}(\tilde q_i > 0.98)
 z_{root} < 0.31
 \]
 
-则认为摔倒：
+则认为摔倒。这里的 `0.31` 来自代码配置：
+
+```python
+termination_height = 0.31
+death_cost = -2.0
+```
+
+reward 计算代码是：
+
+```python
+rewards = torch.where(
+    terminated,
+    torch.full_like(rewards, self.cfg.death_cost),
+    rewards,
+)
+```
+
+中文解释：
+
+- `terminated=True`：Ant 的 torso/root 高度低于 `0.31m`，认为摔倒。
+- `death_cost=-2.0`：摔倒时本步 reward 直接变成 `-2.0`。
+- `torch.where(terminated, death_cost, rewards)`：对每个 env 单独判断，摔倒的 env 用 `-2.0`，没摔倒的 env 保留正常 reward。
+
+注意这里是 override，而不是在原 reward 上再加一个负数。
+
+也就是说，如果某一步原本 reward 算出来是：
+
+\[
+r_t = 3.5
+\]
+
+但这个 env 同时摔倒了，那么最终不是：
+
+\[
+3.5 - 2.0 = 1.5
+\]
+
+而是直接：
 
 \[
 r_t = -2.0
 \]
-
-注意这里是 override，而不是在原 reward 上再加一个负数。
 
 ---
 
@@ -793,17 +1160,74 @@ r_t = -2.0
 
 ## 10.1 两类 done
 
-代码中区分：
+代码中 done 分成两类：
 
 ```python
-terminated = root_z < termination_height
-truncated = episode_length >= max_episode_length - 1
+died = root_pos[:, 2] < self.cfg.termination_height
+time_out = self.episode_length_buf >= self.max_episode_length - 1
+return died, time_out
 ```
+
+在 `step()` 里会合并成最终 done：
+
+```python
+self.reset_terminated, self.reset_time_outs = self.compute_dones()
+dones = self.reset_terminated | self.reset_time_outs
+```
+
+中文解释：
+
+| 名称 | 代码变量 | 中文含义 | 具体条件 |
+|---|---|---|---|
+| terminated | `died` / `reset_terminated` | 因为失败而终止，也就是 Ant 摔倒了 | `root_z < 0.31` |
+| truncated | `time_out` / `reset_time_outs` | 不是失败，而是 episode 到达最大时长，被截断 | `episode_length_buf >= 899` |
+| done | `dones` | 只要 terminated 或 truncated 任意一个为真，就需要 reset | `terminated OR truncated` |
+
+这里的具体数值来自 `AntTaskCfg`：
+
+```python
+episode_length_s = 15.0
+sim_dt = 1.0 / 120.0
+decimation = 2
+termination_height = 0.31
+```
+
+先算一个 RL step 的时间：
+
+\[
+\Delta t_{RL} = \Delta t_{phys} \times \text{decimation}
+= \frac{1}{120} \times 2
+= \frac{1}{60}\ \text{s}
+\]
+
+再算最多多少个 RL step：
+
+```python
+max_episode_length = ceil(episode_length_s / rl_dt)
+                   = ceil(15.0 / (1/60))
+                   = 900
+```
+
+所以代码里：
+
+```python
+time_out = episode_length_buf >= max_episode_length - 1
+```
+
+等价于：
+
+```python
+time_out = episode_length_buf >= 899
+```
+
+为什么是 `max_episode_length - 1`？
+
+因为 `episode_length_buf` 从 0 开始计数，而不是从 1 开始。对于最长 900 个 RL step 的 episode，最后一个有效索引是 899。
 
 数学上：
 
 \[
-d_t^{death} = \mathbf{1}(z_t < 0.31)
+d_t^{death} = \mathbf{1}(z_{root,t} < 0.31)
 \]
 
 \[
@@ -816,21 +1240,43 @@ d_t^{timeout} = \mathbf{1}(T_t \ge 899)
 d_t = d_t^{death} \lor d_t^{timeout}
 \]
 
+注意两者语义不同：
+
+- `terminated=True`：Ant 真的失败了，reward 会被覆盖成 `death_cost = -2.0`。
+- `time_out=True`：只是时间到了，不代表失败，reward 不会被 death cost 覆盖。
+
 ---
 
 ## 10.2 自动 reset
 
-step 内部做：
+`step()` 内部会自动 reset 已经 done 的 env：
 
 ```python
-reset_env_ids = dones.nonzero(...)
+reset_env_ids = dones.nonzero(as_tuple=False).squeeze(-1)
 self.reset_idx(reset_env_ids)
 ```
 
+逐行解释：
+
+| 代码 | 中文含义 |
+|---|---|
+| `dones.nonzero(...)` | 找出所有 `done=True` 的环境编号 |
+| `squeeze(-1)` | 把 shape 从 `[num_done, 1]` 压成 `[num_done]` |
+| `reset_idx(reset_env_ids)` | 只重置这些结束的环境，不影响其他还在跑的 Ant |
+
+举例：如果 4096 个环境里第 3、19、200 个 Ant 摔倒了：
+
+```python
+reset_env_ids = tensor([3, 19, 200])
+```
+
+那么只 reset 这三个环境。
+
 这意味着：
 
-- 当前 step 返回的 `rewards` 和 `dones` 仍然对应终止前的 transition
-- 返回的 `obs` 已经是 reset 后的新 episode 初始 obs
+- 当前 step 返回的 `rewards` 和 `dones` 仍然对应终止前的 transition。
+- 返回的 `obs` 已经是 reset 后的新 episode 初始 obs。
+- PPO 存储 transition 时，靠 `done=True` 知道这里不能继续 bootstrap 老 episode。
 
 这是很多 vectorized RL env 的常见做法。
 
