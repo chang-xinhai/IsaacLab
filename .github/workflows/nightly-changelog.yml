@@ -10,8 +10,10 @@
 # tracked branch's changelog current without requiring a maintainer to run
 # ``compile`` by hand.
 #
-# Scheduled workflow — must live on the default branch (``main``) for the
-# cron to register. See ``.github/workflows/README.md``.
+# Scheduled execution is intentionally disabled in this fork: the upstream
+# workflow requires an installed GitHub App and repository secrets that are
+# not present here. Maintainers can still dispatch it manually after adding
+# those credentials. See ``.github/workflows/README.md``.
 #
 # Adding a branch to the nightly set is a one-line edit to ``env.CRON_BRANCHES``
 # below. Each target branch uses its own ``tools/changelog/cli.py`` (the
@@ -39,10 +41,6 @@ env:
   CRON_BRANCHES: develop,release/3.0.0-beta2
 
 on:
-  schedule:
-    # Run nightly at 5 AM UTC (one hour after daily-compatibility, so we
-    # don't compete for runner capacity).
-    - cron: '0 5 * * *'
   workflow_dispatch:
     inputs:
       branch:
