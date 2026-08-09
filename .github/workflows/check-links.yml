@@ -77,6 +77,8 @@ jobs:
           --exclude 'slurm\.schedmd\.com'
           --exclude '^https://unitree\.com/h1$'
           --exclude '^https://bostondynamics\.com/reinforcement-learning-researcher-kit/?$'
+          --exclude '^https://catalog\.ngc\.nvidia\.com/orgs/nvidia/resources/cloudxr-js-early-access\?version=6\.0\.0-beta$'
+          --exclude '^https://stackoverflow\.com/questions/744373/circular-or-cyclic-imports-in-python$'
           --max-retries 3
           --retry-wait-time 5
           --timeout 30
